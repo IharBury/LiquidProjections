@@ -1,12 +1,18 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics.Eventing.Reader;
 using System.Linq;
 using System.Threading.Tasks;
 using Chill;
 using FakeItEasy;
 using FluentAssertions;
+
+using LiquidProjections.NEventStore.Logging;
+
 using NEventStore;
 using NEventStore.Persistence;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace LiquidProjections.NEventStore.Specs
 {
@@ -117,11 +123,11 @@ namespace LiquidProjections.NEventStore.Specs
                 {
                     eventStore = A.Fake<IPersistStreams>();
                     A.CallTo(() => eventStore.GetFrom(A<string>.Ignored))
-                    .Invokes(_ =>
-                    {
-                        eventStoreQueriedSource.SetResult(null);
-                    })
-                    .Returns(new ICommit[0]);
+                        .Invokes(_ =>
+                        {
+                            eventStoreQueriedSource.SetResult(null);
+                        })
+                        .Returns(new ICommit[0]);
 
                     WithSubject(_ => new NEventStoreAdapter(eventStore, 11, pollingInterval, 100, () => utcNow));
 
@@ -243,6 +249,130 @@ namespace LiquidProjections.NEventStore.Specs
                 if (!Task.Run(() => WhenAction.ShouldNotThrow()).Wait(TimeSpan.FromSeconds(10)))
                 {
                     throw new InvalidOperationException("The subscription has not stopped in 10 seconds.");
+                }
+            }
+        }
+
+        public class When_multiple_subscribers_exist : GivenSubject<NEventStoreAdapter>
+        {
+            private readonly TimeSpan pollingInterval = 1.Seconds();
+            private TaskCompletionSource<Exception>[] completionSources;
+
+            public When_multiple_subscribers_exist(ITestOutputHelper output)
+            {
+                Given(() =>
+                {
+                    LogProvider.SetCurrentLogProvider(new TestLogProvider(output));
+
+                    var eventStore = A.Fake<IPersistStreams>();
+                    A.CallTo(() => eventStore.GetFrom(A<string>.Ignored))
+                        .ReturnsLazily(call =>
+                        {
+                            string checkpointString = call.GetArgument<string>(0);
+                            int checkPoint =  !string.IsNullOrEmpty(checkpointString) ? int.Parse(checkpointString) : 0;
+
+                            if (checkPoint < 10000)
+                            {
+                                return Enumerable
+                                    .Range(checkPoint + 1, 100)
+                                    .Select(c => new CommitBuilder().WithCheckpoint(c.ToString()).Build())
+                                    .ToArray();
+                            }
+                            else
+                            {
+                                return new ICommit[0];
+                            }
+                        });
+
+                    WithSubject(_ => new NEventStoreAdapter(eventStore, 11, pollingInterval, 100, () => DateTime.UtcNow));
+                });
+
+                When(() =>
+                {
+                    completionSources = new TaskCompletionSource<Exception>[20];
+
+                    for (int index = 0; index < completionSources.Length; index++)
+                    {
+                        var completionSource = new TaskCompletionSource<Exception>();
+
+                        int temp = index;
+                        Subject.Subscribe(null, async transactions =>
+                        {
+                            string id = temp.ToString();
+
+                            if (transactions.Count > 1 && transactions.First().Checkpoint == transactions.Last().Checkpoint)
+                            {
+                                completionSource.SetResult(new InvalidOperationException(
+                                    $"Subscriber {id} received an invalid page of transactions"));
+                            }
+
+                            if (transactions.Any(t => t.Checkpoint > 10000))
+                            {
+                                output.WriteLine($"Subscriber {id} received all transactions ");
+                                completionSource.SetResult(null);
+                            }
+
+                            await Task.Delay(new Random().Next(0, 50));
+                        }, index.ToString());
+
+                        completionSources[index] = completionSource;
+                    }
+                });
+            }
+
+            [Fact]
+            public async Task Then_no_exceptions_must_have_happened()
+            {
+                var exceptions = await Task.WhenAll(completionSources.Select(s => s.Task));
+                foreach (Exception exception in exceptions)
+                {
+                    if (exception != null)
+                    {
+                        throw exception;
+                    }
+                }
+            }
+
+            private class TestLogProvider : ILogProvider
+            {
+                private readonly ITestOutputHelper testOutputHelper;
+
+                public TestLogProvider(ITestOutputHelper testOutputHelper)
+                {
+                    this.testOutputHelper = testOutputHelper;
+                }
+
+                public Logger GetLogger(string name)
+                {
+                    return (logLevel, messageFunc, exception, formatParameters) =>
+                    {
+                        string message = messageFunc();
+
+                        if ((formatParameters != null) && (formatParameters.Length > 1))
+                        {
+                            message = string.Format(message, formatParameters);
+                        }
+
+                        testOutputHelper.WriteLine(message);
+                        return true;
+                    };
+                }
+
+                public IDisposable OpenNestedContext(string message)
+                {
+                    return new NullDisposable();
+                }
+
+                public IDisposable OpenMappedContext(string key, string value)
+                {
+                    return new NullDisposable();
+                }
+
+                private class NullDisposable : IDisposable
+                {
+                    public void Dispose()
+                    {
+                    }
                 }
             }
         }
